@@ -1,0 +1,152 @@
+version: "3.9"
+
+services:
+  # ──────────────────────────────────────────────
+  # 1. Reverse Proxy — Nginx
+  # ──────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: pdf-tools-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - pdf-tools-net
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # 2. API Gateway — Node.js + TypeScript
+  # ──────────────────────────────────────────────
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: pdf-tools-gateway
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - GATEWAY_PORT=${GATEWAY_PORT:-3000}
+      - GATEWAY_HOST=${GATEWAY_HOST:-0.0.0.0}
+      - STIRLING_URL=${STIRLING_URL:-http://stirling:8080}
+      - STIRLING_TIMEOUT_MS=${STIRLING_TIMEOUT_MS:-120000}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme_redis_password}
+      - STORAGE_BASE_PATH=${STORAGE_BASE_PATH:-/tmp/pdf-tools-storage}
+      - FILE_RETENTION_MINUTES=${FILE_RETENTION_MINUTES:-30}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-100}
+      - CLEANUP_INTERVAL_MS=${CLEANUP_INTERVAL_MS:-60000}
+      - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-900000}
+      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
+      - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      - REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS:-120000}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - temp-storage:/tmp/pdf-tools-storage
+    depends_on:
+      stirling:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pdf-tools-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # 3. Stirling PDF — Core PDF Engine
+  # ──────────────────────────────────────────────
+  stirling:
+    image: frooodle/s-pdf:latest
+    container_name: pdf-tools-stirling
+    ports:
+      - "8080:8080"
+    environment:
+      - DOCKER_ENABLE_SECURITY=false
+      - SECURITY_ENABLELOGIN=false
+      - SYSTEM_DEFAULTLOCALE=en-US
+      - SYSTEM_MAXFILESIZE=100
+    volumes:
+      - stirling-data:/usr/share/tessdata
+      - temp-storage:/tmp/pdf-tools-storage
+    networks:
+      - pdf-tools-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/info/status || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # 4. Redis — Cache & Job Queue
+  # ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pdf-tools-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme_redis_password} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - pdf-tools-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme_redis_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────
+  # 5. Worker Service Placeholder (Phase 2)
+  # ──────────────────────────────────────────────
+  # Uncomment when custom compression worker is ready:
+  #
+  # compression-worker:
+  #   build:
+  #     context: ./worker
+  #     dockerfile: Dockerfile
+  #   container_name: pdf-tools-worker
+  #   environment:
+  #     - NODE_ENV=${NODE_ENV:-production}
+  #     - REDIS_HOST=${REDIS_HOST:-redis}
+  #     - REDIS_PORT=${REDIS_PORT:-6379}
+  #     - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme_redis_password}
+  #     - STORAGE_BASE_PATH=${STORAGE_BASE_PATH:-/tmp/pdf-tools-storage}
+  #   volumes:
+  #     - temp-storage:/tmp/pdf-tools-storage
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - pdf-tools-net
+  #   restart: unless-stopped
+
+# ──────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────
+networks:
+  pdf-tools-net:
+    driver: bridge
+    name: pdf-tools-network
+
+# ──────────────────────────────────────────────
+# Volumes
+# ──────────────────────────────────────────────
+volumes:
+  temp-storage:
+    driver: local
+  stirling-data:
+    driver: local
+  redis-data:
+    driver: local
